@@ -219,8 +219,8 @@ class PPO:
 
 
 if __name__ == '__main__':
-    data_set_name = "test-pow2-ta21"
-    path = "../data_set_gen_time/"
+    data_set_name = "pow2"
+    path = "../data_set_sizes/"
     parameters = data_set_name
     param = [parameters, "converge_cnt", "total_time", "no-op"]
 
@@ -229,7 +229,7 @@ if __name__ == '__main__':
         print(file_name + "========================")
         title = file_name.split('.')[0]
         name = file_name.split('_')[0]
-        env = JobEnv(title, path, no_op=False)
+        env = JobEnv(title, path)
         scale = env.job_num * env.machine_num
         model = PPO(env, unit_num=env.state_num, memory_size=9, batch_size=2*scale, clip_ep=0.2)
         simple_results.loc[title] = model.train(name, is_reschedule=False)
