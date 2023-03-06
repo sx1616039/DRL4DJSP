@@ -206,7 +206,7 @@ class PPO:
     def test(self, data_set):
         self.load_params(data_set)
         value = []
-        for m in range(10):
+        for m in range(30):
             state = self.env.reset()
             while True:
                 action, _ = self.select_action(state)
@@ -219,19 +219,20 @@ class PPO:
 
 
 if __name__ == '__main__':
-    data_set_name = "pow2"
-    path = "../data_set_sizes/"
-    parameters = data_set_name
-    param = [parameters, "converge_cnt", "total_time", "no-op"]
-
-    simple_results = pd.DataFrame(columns=param, dtype=int)
-    for file_name in os.listdir(path):
-        print(file_name + "========================")
-        title = file_name.split('.')[0]
-        name = file_name.split('_')[0]
-        env = JobEnv(title, path)
-        scale = env.job_num * env.machine_num
-        model = PPO(env, unit_num=env.state_num, memory_size=9, batch_size=2*scale, clip_ep=0.2)
-        simple_results.loc[title] = model.train(name, is_reschedule=False)
-        # simple_results.loc[title] = model.test(name)
-    simple_results.to_csv(parameters + ".csv")
+    data_set_name = "uniform_time_large-"
+    path = "../uniform_time_large/"
+    param = [data_set_name, "converge_cnt", "total_time"]
+    for ep in range(6):
+        data_set_name += str(ep)
+        simple_results = pd.DataFrame(columns=param, dtype=int)
+        for file_name in os.listdir(path):
+            print(file_name + "========================")
+            title = file_name.split('.')[0]
+            name = file_name.split('_')[0]
+            env = JobEnv(title, path, no_op=False)
+            scale = env.job_num * env.machine_num
+            model = PPO(env, unit_num=env.state_num, memory_size=9, batch_size=2 * scale, clip_ep=0.2)
+            # simple_results.loc[title] = model.train(name, is_reschedule=True)
+            # simple_results.loc[title] = model.train(title, is_reschedule=False)
+            # simple_results.loc[title] = model.test(name)
+        simple_results.to_csv(data_set_name + ".csv")
