@@ -8,69 +8,110 @@ import torch.nn.functional as F
 import torch.optim as optimizer
 from torch.distributions import Categorical
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
-from env_solution import JobEnv
+from env_gray import JobEnv
+from math import floor, ceil
+
+
+def SpatialPyramidPooling2d(input_x, level, pool_type='max_pool'):
+    N, C, H, W = input_x.size()
+    for i in range(level):
+        level = i + 1
+        kernel_size = (ceil(H / level), ceil(W / level))
+        stride = (ceil(H / level), ceil(W / level))
+        padding = (floor((kernel_size[0] * level - H + 1) / 2), floor((kernel_size[1] * level - W + 1) / 2))
+
+        if pool_type == 'max_pool':
+            tensor = (F.max_pool2d(input_x, kernel_size=kernel_size, stride=stride, padding=padding)).view(N, -1)
+        else:
+            tensor = (F.avg_pool2d(input_x, kernel_size=kernel_size, stride=stride, padding=padding)).view(N, -1)
+
+        if i == 0:
+            res = tensor
+        else:
+            res = torch.cat((res, tensor), 1)
+    return res
+
+
+def _cal_num_grids(level):
+    count = 0
+    for i in range(level):
+        count += (i + 1) * (i + 1)
+    return count
 
 
 class Actor(nn.Module):
-    def __init__(self, num_input, num_output, node_num=100):
+    def __init__(self, input_channel=1, out_channel=3, out_num=6, num_level=4):
         super(Actor, self).__init__()
-        self.fc1 = nn.Linear(num_input, node_num)
-        self.fc2 = nn.Linear(node_num, node_num)
-        self.action_head = nn.Linear(node_num, num_output)
+        self.num_level = num_level
+        self.num_grid = _cal_num_grids(num_level)
+        self.feature1 = nn.Sequential(nn.Conv2d(input_channel, out_channel, kernel_size=(5, 5), padding=2), nn.ReLU())
+        # self.fc2 = nn.Linear(out_channel * self.num_grid, out_channel * self.num_grid)
+        self.action_head = nn.Linear(out_channel * self.num_grid, out_num)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.feature1(x)
+        x = SpatialPyramidPooling2d(x, self.num_level)
+        # x = self.fc2(x)
         action_prob = F.softmax(self.action_head(x), dim=1)
         return action_prob
 
 
 class Critic(nn.Module):
-    def __init__(self, num_input, num_output=1, node_num=100):
+    def __init__(self, input_channel=1, out_channel=3, out_num=1, num_level=4):
         super(Critic, self).__init__()
-        self.fc1 = nn.Linear(num_input, node_num)
-        self.fc2 = nn.Linear(node_num, node_num)
-        self.state_value = nn.Linear(node_num, num_output)
+        self.num_level = num_level
+        self.num_grid = _cal_num_grids(num_level)
+        self.feature1 = nn.Sequential(nn.Conv2d(input_channel, out_channel, kernel_size=(5, 5), padding=2), nn.ReLU())
+        # self.fc2 = nn.Linear(out_channel * self.num_grid, out_channel * self.num_grid)
+        self.state_value = nn.Linear(out_channel * self.num_grid, out_num)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        value = self.state_value(x)
-        return value
+        x = self.feature1(x)
+        x = SpatialPyramidPooling2d(x, self.num_level)
+        # x = self.fc2(x)
+        state_value = self.state_value(x)
+        return state_value
 
 
 class PPO:
-    def __init__(self, j_env, unit_num=100, memory_size=5, batch_size=32, clip_ep=0.2):
+    def __init__(self, j_env, memory_size=5, batch_size=32, clip_ep=0.2):
         super(PPO, self).__init__()
         self.env = j_env
         self.memory_size = memory_size
         self.batch_size = batch_size  # update batch size
         self.epsilon = clip_ep
 
-        self.state_dim = self.env.state_num
         self.action_dim = self.env.action_num
         self.case_name = self.env.case_name
         self.gamma = 0.999  # reward discount
         self.A_LR = 1e-3  # learning rate for actor
         self.C_LR = 3e-3  # learning rate for critic
-        self.UPDATE_STEPS = 10  # update steps
+        self.UPDATE_STEPS = 10  # actor update steps
         self.max_grad_norm = 0.5
+        self.training_step = 0
 
-        self.actor_net = Actor(self.state_dim, self.action_dim, node_num=unit_num)
-        self.critic_net = Critic(self.state_dim, node_num=unit_num)
+        self.actor_net = Actor(out_num=self.action_dim)
+        self.critic_net = Critic()
         self.actor_optimizer = optimizer.Adam(self.actor_net.parameters(), self.A_LR)
         self.critic_net_optimizer = optimizer.Adam(self.critic_net.parameters(), self.C_LR)
+
         if not os.path.exists('param'):
-            os.makedirs('param/net_param')
-        self.alpha = 0.6  # parameters for priority replay
-        self.capacity = self.memory_size*self.state_dim
+            os.makedirs('param')
+        self.capacity = self.memory_size * self.env.job_num * self.env.machine_num
         self.priorities = np.zeros([self.capacity], dtype=np.float32)
-        self.training_step = 0
+        self.alpha = 0.6  # parameters for priority replay
+        self.beta = 0.4
+        self.upper_bound = 1
+        self.convergence_episode = 5000
+        self.beta_increment = (self.upper_bound - self.beta) / self.convergence_episode
+        self.train_steps = 0
+        self.replay_size = self.env.job_num * self.env.machine_num
+        self.PER_NUM = 2
         self.init_size = 1
-        self.convergence_episode = 2000
 
     def select_action(self, state):
-        state = torch.from_numpy(state).float().unsqueeze(0)
+        state_tensor = torch.tensor(np.array(state), dtype=torch.float)
+        state = state_tensor.unsqueeze(0)
         with torch.no_grad():
             action_prob = self.actor_net(state)
         c = Categorical(action_prob)
@@ -83,15 +124,19 @@ class PPO:
             value = self.critic_net(state)
         return value.item()
 
-    def save_params(self):
-        torch.save(self.actor_net.state_dict(), 'param/net_param/' + self.env.case_name + '_actor_net.model')
-        torch.save(self.critic_net.state_dict(), 'param/net_param/' + self.env.case_name + '_critic_net.model')
+    def save_params(self, instance_name):
+        torch.save(self.actor_net.state_dict(), 'param/' + instance_name + '_actor_net.model')
+        torch.save(self.critic_net.state_dict(), 'param/' + instance_name + '_critic_net.model')
 
-    def load_params(self, model_name):
-        self.critic_net.load_state_dict(torch.load('param/net_param/' + model_name + '_critic_net.model'))
-        self.actor_net.load_state_dict(torch.load('param/net_param/' + model_name + '_actor_net.model'))
+    def load_params(self, instance_name):
+        self.critic_net.load_state_dict(torch.load('param/' + instance_name + '_critic_net.model'))
+        self.actor_net.load_state_dict(torch.load('param/' + instance_name + '_actor_net.model'))
 
-    def learn(self, state, action, d_r, old_prob):
+    def learn(self, state, action, d_r, old_prob, w=None):
+        if w is not None:
+            weights = torch.tensor(w, dtype=torch.float).view(-1, 1)
+        else:
+            weights = 1
         #  compute the advantage
         d_reward = d_r.view(-1, 1)
         V = self.critic_net(state)
@@ -103,6 +148,7 @@ class PPO:
         ratio = (action_prob / old_prob)
         surrogate = ratio * advantage
         clip_loss = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage
+        # action_loss = -(torch.min(surrogate, clip_loss)*weights).mean()
         action_loss = -torch.min(surrogate, clip_loss).mean()
 
         # update actor network
@@ -112,16 +158,17 @@ class PPO:
         self.actor_optimizer.step()
 
         # update critic network
-        value_loss = torch.sum((d_reward-V).pow(2)/d_reward.size(0))
+        value_loss = sum((d_reward - V).pow(2) / d_reward.size(0) * weights)
         self.critic_net_optimizer.zero_grad()
         value_loss.backward()
         nn.utils.clip_grad_norm_(self.critic_net.parameters(), self.max_grad_norm)
         self.critic_net_optimizer.step()
         # calculate priorities
-        for i in range(len(advantage)):
-            if advantage[i] < 0:
-                advantage[i] = 1e-5
-        prob = advantage ** self.alpha
+        if self.train_steps > self.convergence_episode:
+            for w in range(len(advantage)):
+                if advantage[w] < 0:
+                    advantage[w] = 1e-5
+        prob = abs(advantage) ** self.alpha
         return np.array(prob).flatten()
 
     def update(self, bs, ba, br, bp):
@@ -132,28 +179,33 @@ class PPO:
         d_reward = torch.tensor(br, dtype=torch.float)
 
         for i in range(self.UPDATE_STEPS):
-            self.training_step += 1
+            self.train_steps += 1
             # # replay all experience
             for index in BatchSampler(SubsetRandomSampler(range(len(ba))), self.batch_size, False):
-                self.priorities[index] = self.learn(state[index], action[index], d_reward[index], old_log_prob[index])
+                self.priorities[index] = self.learn(state[index], action[index], d_reward[index],
+                                                    old_log_prob[index])
             # priority replay
-            prob1 = self.priorities / np.sum(self.priorities)
-            replay_size = self.init_size + (self.batch_size - self.init_size) * pow(
-                self.training_step / self.convergence_episode, 2)
-            indices = np.random.choice(len(ba), min(self.batch_size, int(replay_size)), p=prob1)
-            self.learn(state[indices], action[indices], d_reward[indices], old_log_prob[indices])
+            for w in range(self.PER_NUM):
+                prob1 = self.priorities / np.sum(self.priorities)
+                indices = np.random.choice(len(prob1), self.batch_size, p=prob1)
+                weights = (len(ba) * prob1[indices]) ** (- self.beta)
+                if self.beta < self.upper_bound:
+                    self.beta += self.beta_increment
+                weights = weights / np.max(weights)
+                weights = np.array(weights, dtype=np.float32)
+                self.learn(state[indices], action[indices], d_reward[indices], old_log_prob[indices], weights)
 
-    def train(self, model_name, is_reschedule=False):
-        if is_reschedule:
-            self.load_params(model_name)
-        column = ["episode", "make_span", "reward", "min_make_span"]
+    def train(self, data_set, save_params=False):
+        if not save_params:
+            self.load_params(data_set)
+        column = ["episode", "make_span", "reward", "min make span"]
         results = pd.DataFrame(columns=column, dtype=float)
         index = 0
         converged = 0
-        min_make_span = 100000
         converged_value = []
         t0 = time.time()
-        for i_epoch in range(4000):
+        min_make_span = 100000
+        for i_epoch in range(8000):
             if time.time() - t0 >= 3600:
                 break
             bs, ba, br, bp = [], [], [], []
@@ -183,6 +235,7 @@ class PPO:
                         ba[len(ba):len(ba)] = buffer_a
                         br[len(br):len(br)] = discounted_r
                         bp[len(bp):len(bp)] = buffer_p
+
                         index = i_epoch * self.memory_size + m
                         if min_make_span > self.env.current_time:
                             min_make_span = self.env.current_time
@@ -201,41 +254,25 @@ class PPO:
                 break
         if not os.path.exists('results'):
             os.makedirs('results')
-        results.to_csv("results/" + str(self.env.case_name) + "_" + model_name + ".csv")
-        if not is_reschedule:
-            self.save_params()
+        results.to_csv("results/" + str(self.env.case_name) + "_" + data_set + ".csv")
+        if save_params:
+            self.save_params(data_set)
         return min(converged_value), converged, time.time() - t0, min_make_span
-
-    def test(self, data_set):
-        self.load_params(data_set)
-        value = []
-        for m in range(30):
-            state = self.env.reset()
-            while True:
-                action, _ = self.select_action(state)
-                next_state, reward, done = self.env.step(action)
-                state = next_state
-                if done:
-                    break
-            value.append(self.env.current_time)
-        return min(value)
 
 
 if __name__ == '__main__':
-    data_set_name = "area-"
-    path = "../data_set_sizes/"
-    param = [data_set_name, "converge_cnt", "total_time", 'min_make_span']
-    for ep in range(5):
-        data_set_name += str(ep)
-        simple_results = pd.DataFrame(columns=param, dtype=int)
-        for file_name in os.listdir(path):
-            print(file_name + "========================")
-            title = file_name.split('.')[0]
-            name = file_name.split('_')[0]
-            env = JobEnv(title, path, no_op=False)
-            scale = env.job_num * env.machine_num
-            model = PPO(env, unit_num=env.state_num, memory_size=9, batch_size=2 * scale, clip_ep=0.2)
-            # simple_results.loc[title] = model.train(name, is_reschedule=True)
-            simple_results.loc[title] = model.train(title, is_reschedule=False)
-            # simple_results.loc[title] = model.test(name)
-        simple_results.to_csv(data_set_name + ".csv")
+    # training policy
+    parameters = "spp1-6-3-52025"
+    path = "../data_set_spp/"
+    print(parameters)
+    param = [parameters, "converge_cnt", "total_time", "min"]
+    simple_results = pd.DataFrame(columns=param, dtype=int)
+    for file_name in os.listdir(path):
+        print(file_name + "========================")
+        title = file_name.split('.')[0]
+        name = file_name.split('_')[0]
+        env = JobEnv(title, path)
+        scale = env.job_num * env.machine_num
+        model = PPO(env, memory_size=5, batch_size=2 * scale, clip_ep=0.25)
+        simple_results.loc[title] = model.train(title, save_params=True)
+    simple_results.to_csv(parameters + "_result.csv")
